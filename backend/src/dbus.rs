@@ -13,8 +13,10 @@
 //! 处理与 ofono D-Bus 服务的通信
 
 use std::collections::HashMap;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task;
 use tracing::{info, warn};
 use zbus::{proxy, zvariant::OwnedValue, Connection, Proxy};
 
@@ -25,6 +27,9 @@ use crate::models::{
 };
 use crate::serial::with_serial;
 use crate::state::FrontendRuntime;
+
+const CONNECTIVITY_FAILURE_THRESHOLD: u32 = 3;
+const CONNECTIVITY_PROBE_TARGETS: &[&str] = &["223.5.5.5", "114.114.114.114"];
 
 /// ofono NetworkMonitor 代理接口
 #[proxy(
@@ -630,16 +635,52 @@ async fn auto_configure_apn(conn: &Connection, context_path: &str) -> Result<Str
     Ok(format!("Auto-configured APN: {} ({})", apn, protocol))
 }
 
+async fn connectivity_probe() -> Result<bool, String> {
+    task::spawn_blocking(|| {
+        for target in CONNECTIVITY_PROBE_TARGETS {
+            let output = Command::new("ping")
+                .args(["-c", "1", "-W", "2", target])
+                .output();
+
+            match output {
+                Ok(result) if result.status.success() => return Ok(true),
+                Ok(_) => continue,
+                Err(error) => return Err(format!("Failed to execute ping: {}", error)),
+            }
+        }
+
+        Ok(false)
+    })
+    .await
+    .map_err(|e| format!("Connectivity probe task failed: {}", e))?
+}
+
+async fn reconnect_data_connection(conn: &Connection) -> Result<(), String> {
+    set_data_connection(conn, false)
+        .await
+        .map_err(|e| format!("deactivate failed: {}", e))?;
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    set_data_connection(conn, true)
+        .await
+        .map_err(|e| format!("activate failed: {}", e))
+}
+
 /// 检查并恢复数据连接
 ///
 /// 这个函数被 watchdog 调用，检查数据连接状态并在需要时恢复
 ///
 /// # Arguments
 /// * `conn` - D-Bus 连接
+/// * `connectivity_failures` - 连通性探测连续失败计数（跨调用累积）
 ///
 /// # Returns
 /// 当前状态描述字符串
-async fn check_and_restore_data_connection(conn: &Connection) -> String {
+async fn check_and_restore_data_connection(
+    conn: &Connection,
+    connectivity_failures: &mut u32,
+) -> String {
     // 1. 检查网络注册状态
     let net_status = match NetworkRegistrationProxy::new(conn).await {
         Ok(net_proxy) => {
@@ -656,6 +697,7 @@ async fn check_and_restore_data_connection(conn: &Connection) -> String {
     
     // 网络未注册时不尝试恢复
     if net_status != "registered" && net_status != "roaming" {
+        *connectivity_failures = 0;
         return format!("Waiting for network (status: {})", net_status);
     }
     
@@ -708,13 +750,50 @@ async fn check_and_restore_data_connection(conn: &Connection) -> String {
     
     // 5. 如果连接未激活，尝试激活
     if !active {
+        *connectivity_failures = 0;
         match set_data_connection(conn, true).await {
             Ok(_) => return format!("Connection restored (APN: {})", apn),
             Err(e) => return format!("Activation failed: {}", e),
         }
     }
-    
-    // 6. 连接正常
+
+    // 6. 连接已激活，做真实连通性探测（Active=true 但无流量 = 静默假死）
+    match connectivity_probe().await {
+        Ok(true) => {
+            *connectivity_failures = 0;
+        }
+        Ok(false) => {
+            *connectivity_failures = connectivity_failures.saturating_add(1);
+            if *connectivity_failures >= CONNECTIVITY_FAILURE_THRESHOLD {
+                match reconnect_data_connection(conn).await {
+                    Ok(_) => {
+                        let failures = *connectivity_failures;
+                        *connectivity_failures = 0;
+                        return format!(
+                            "Connectivity probe failed {} times, data connection reconnected (APN: {})",
+                            failures, apn
+                        );
+                    }
+                    Err(e) => {
+                        return format!(
+                            "Connectivity probe failed {} times, reconnect failed: {}",
+                            *connectivity_failures, e
+                        );
+                    }
+                }
+            }
+
+            return format!(
+                "Connected but connectivity probe failed ({}/{})",
+                *connectivity_failures, CONNECTIVITY_FAILURE_THRESHOLD
+            );
+        }
+        Err(e) => {
+            return format!("Connected but connectivity probe unavailable: {}", e);
+        }
+    }
+
+    // 7. 连接正常
     format!("Connected (APN: {})", apn)
 }
 
@@ -733,6 +812,7 @@ pub async fn data_connection_watchdog(
 ) {
     let mut last_data_log = String::new();
     let mut last_usb_tether_action = false; // 上次是否修正了 USB 共享健康状态
+    let mut connectivity_failures = 0u32;
     
     loop {
         let refresh = config_manager.get_refresh();
@@ -766,7 +846,7 @@ pub async fn data_connection_watchdog(
         }
         
         // 2. 检查并恢复数据连接
-        let result = check_and_restore_data_connection(&conn).await;
+        let result = check_and_restore_data_connection(&conn, &mut connectivity_failures).await;
         
         // 只在状态变化时打印日志，避免刷屏
         if result != last_data_log {
